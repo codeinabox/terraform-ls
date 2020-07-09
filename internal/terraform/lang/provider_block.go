@@ -117,12 +117,12 @@ func (p *providerBlock) CompletionCandidatesAtPos(pos hcl.Pos) (CompletionCandid
 	return cb.completionCandidatesAtPos(pos)
 }
 
-func providerCandidates(names []string) []*labelCandidate {
+func providerCandidates(providers []schema.ProviderIdentity) []*labelCandidate {
 	candidates := []*labelCandidate{}
-	for _, name := range names {
+	for _, identity := range providers {
 		candidates = append(candidates, &labelCandidate{
-			label:  name,
-			detail: "provider",
+			label:  identity.RawName(),
+			detail: identity.QualifiedName(),
 		})
 	}
 	return candidates

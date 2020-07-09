@@ -9,14 +9,13 @@ import (
 
 	"github.com/hashicorp/go-version"
 	tfjson "github.com/hashicorp/terraform-json"
-	"github.com/hashicorp/terraform-ls/internal/terraform/errors"
 	"github.com/hashicorp/terraform-ls/internal/terraform/exec"
 	"golang.org/x/sync/semaphore"
 )
 
 type Reader interface {
 	ProviderConfigSchema(name string) (*tfjson.Schema, error)
-	Providers() ([]string, error)
+	Providers() ([]ProviderIdentity, error)
 	ResourceSchema(rType string) (*tfjson.Schema, error)
 	Resources() ([]Resource, error)
 	DataSourceSchema(dsType string) (*tfjson.Schema, error)
@@ -29,24 +28,24 @@ type Writer interface {
 
 type Resource struct {
 	Name            string
-	Provider        string
+	Provider        ProviderIdentity
 	Description     string
 	DescriptionKind tfjson.SchemaDescriptionKind
 }
 
 type DataSource struct {
 	Name            string
-	Provider        string
+	Provider        ProviderIdentity
 	Description     string
 	DescriptionKind tfjson.SchemaDescriptionKind
 }
 
-type StorageFactory func() *Storage
+type StorageFactory func(v string) (*Storage, error)
 
 type Storage struct {
-	ps *tfjson.ProviderSchemas
-
-	logger *log.Logger
+	ps        *tfjson.ProviderSchemas
+	converter ProviderIdentityConverter
+	logger    *log.Logger
 
 	// sem ensures atomic reading and obtaining of schemas
 	// as the process of obtaining it may not be thread-safe
@@ -55,49 +54,34 @@ type Storage struct {
 
 var defaultLogger = log.New(ioutil.Discard, "", 0)
 
-func NewStorage() *Storage {
+func newStorage() *Storage {
 	return &Storage{
 		logger: defaultLogger,
 		sem:    semaphore.NewWeighted(1),
 	}
 }
 
-func NewStorageForVersion(version string) (*Storage, error) {
-	// TODO: https://github.com/hashicorp/terraform-ls/issues/164
-	return nil, fmt.Errorf("not implemented yet")
-}
-
-func SchemaSupportsTerraform(v string) error {
-	c, err := version.NewConstraint(
-		">= 0.12.0", // Version 0.12 first introduced machine-readable schemas
-	)
+func NewStorageForVersion(vs string) (*Storage, error) {
+	ver, err := version.NewVersion(vs)
 	if err != nil {
-		return fmt.Errorf("failed to parse constraint: %w", err)
+		return nil, err
 	}
 
-	rawVer, err := version.NewVersion(v)
-	if err != nil {
-		return fmt.Errorf("failed to parse version: %w", err)
+	v0_13 := version.Must(version.NewVersion("0.13.0"))
+	if ver.GreaterThanOrEqual(v0_13) {
+		s := newStorage()
+		s.converter = v013ProviderIdentityConverter{}
+		return s, nil
 	}
 
-	// Assume that alpha/beta/rc prereleases have the same compatibility
-	segments := rawVer.Segments64()
-	segmentsOnly := fmt.Sprintf("%d.%d.%d", segments[0], segments[1], segments[2])
-	ver, err := version.NewVersion(segmentsOnly)
-	if err != nil {
-		return fmt.Errorf("failed to parse stripped version: %w", err)
+	v0_12 := version.Must(version.NewVersion("0.12.0"))
+	if ver.GreaterThanOrEqual(v0_12) {
+		s := newStorage()
+		s.converter = v012ProviderIdentityConverter{}
+		return s, nil
 	}
 
-	supported := c.Check(ver)
-	if !supported {
-		return &errors.UnsupportedTerraformVersion{
-			Component:   "schema storage",
-			Version:     v,
-			Constraints: c,
-		}
-	}
-
-	return nil
+	return nil, fmt.Errorf("no schema storage available for terraform %s", vs)
 }
 
 func (s *Storage) SetLogger(logger *log.Logger) {
@@ -145,7 +129,10 @@ func (s *Storage) schema() (*tfjson.ProviderSchemas, error) {
 	return s.ps, nil
 }
 
-func (s *Storage) ProviderConfigSchema(name string) (*tfjson.Schema, error) {
+func (s *Storage) ProviderConfigSchema(rawIdentity string) (*tfjson.Schema, error) {
+	identity := s.converter.RawToQualifiedName(rawIdentity)
+	name := ProviderIdentity{identity: identity, converter: s.converter}
+
 	s.logger.Printf("Reading %q provider schema", name)
 
 	ps, err := s.schema()
@@ -153,26 +140,28 @@ func (s *Storage) ProviderConfigSchema(name string) (*tfjson.Schema, error) {
 		return nil, err
 	}
 
-	schema, ok := ps.Schemas[name]
+	schema, ok := ps.Schemas[name.QualifiedName()]
 	if !ok {
-		return nil, &SchemaUnavailableErr{"provider", name}
+		return nil, &SchemaUnavailableErr{"provider", name.QualifiedName()}
 	}
 
 	if schema.ConfigSchema == nil {
-		return nil, &SchemaUnavailableErr{"provider", name}
+		return nil, &SchemaUnavailableErr{"provider", name.QualifiedName()}
 	}
 
 	return schema.ConfigSchema, nil
 }
 
-func (s *Storage) Providers() ([]string, error) {
+func (s *Storage) Providers() ([]ProviderIdentity, error) {
 	ps, err := s.schema()
 	if err != nil {
 		return nil, err
 	}
 
-	providers := make([]string, 0)
-	for name := range ps.Schemas {
+	providers := make([]ProviderIdentity, 0)
+	for rawName := range ps.Schemas {
+		identity := s.converter.QualifiedNameToRaw(rawName)
+		name := ProviderIdentity{identity: identity, converter: s.converter}
 		providers = append(providers, name)
 	}
 
@@ -180,7 +169,6 @@ func (s *Storage) Providers() ([]string, error) {
 }
 
 func (s *Storage) ResourceSchema(rType string) (*tfjson.Schema, error) {
-	// TODO: this is going to need to use provider identities, especially in 0.13
 	s.logger.Printf("Reading %q resource schema", rType)
 
 	ps, err := s.schema()
@@ -188,9 +176,8 @@ func (s *Storage) ResourceSchema(rType string) (*tfjson.Schema, error) {
 		return nil, err
 	}
 
-	// Vast majority of resources should follow naming convention
-	// of <provider>_resource_name, but this is not enforced
-	// in any way so we have to check all providers
+	// TODO: Reflect provider alias associations here
+	// (need to be parsed and made accessible first)
 	for _, schema := range ps.Schemas {
 		rSchema, ok := schema.ResourceSchemas[rType]
 		if ok {
@@ -211,7 +198,10 @@ func (s *Storage) Resources() ([]Resource, error) {
 	for provider, schema := range ps.Schemas {
 		for name, r := range schema.ResourceSchemas {
 			resources = append(resources, Resource{
-				Provider:    provider,
+				Provider: ProviderIdentity{
+					identity:  provider,
+					converter: s.converter,
+				},
 				Name:        name,
 				Description: r.Block.Description,
 			})
@@ -229,9 +219,8 @@ func (s *Storage) DataSourceSchema(dsType string) (*tfjson.Schema, error) {
 		return nil, err
 	}
 
-	// Vast majority of Datasources should follow naming convention
-	// of <provider>_datasource_name, but this is not enforced
-	// in any way so we have to check all providers
+	// TODO: Reflect provider alias associations here
+	// (need to be parsed and made accessible first)
 	for _, schema := range ps.Schemas {
 		rSchema, ok := schema.DataSourceSchemas[dsType]
 		if ok {
@@ -252,7 +241,10 @@ func (s *Storage) DataSources() ([]DataSource, error) {
 	for provider, schema := range ps.Schemas {
 		for name, d := range schema.DataSourceSchemas {
 			dataSources = append(dataSources, DataSource{
-				Provider:    provider,
+				Provider: ProviderIdentity{
+					identity:  provider,
+					converter: s.converter,
+				},
 				Name:        name,
 				Description: d.Block.Description,
 			})
