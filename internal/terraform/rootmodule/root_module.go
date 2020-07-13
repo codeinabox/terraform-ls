@@ -25,6 +25,7 @@ type rootModule struct {
 	// loading
 	isLoading     bool
 	isLoadingMu   *sync.RWMutex
+	loadingDone   <-chan struct{}
 	cancelLoading context.CancelFunc
 	loadErr       error
 	loadErrMu     *sync.RWMutex
@@ -146,17 +147,32 @@ func (rm *rootModule) discoverModuleCache(dir string) error {
 	return nil
 }
 
+func (rm *rootModule) Modules() []ModuleRecord {
+	rm.moduleMu.Lock()
+	defer rm.moduleMu.Unlock()
+	if rm.moduleManifest == nil {
+		return []ModuleRecord{}
+	}
+
+	return rm.moduleManifest.Records
+}
+
 func (rm *rootModule) SetLogger(logger *log.Logger) {
 	rm.logger = logger
 }
 
-func (rm *rootModule) StartLoading() {
+func (rm *rootModule) StartLoading() error {
+	if !rm.IsLoadingDone() {
+		return fmt.Errorf("root module is already being loaded")
+	}
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	rm.cancelLoading = cancelFunc
+	rm.loadingDone = ctx.Done()
 
 	go func(ctx context.Context) {
 		rm.setLoadErr(rm.load(ctx))
 	}(ctx)
+	return nil
 }
 
 func (rm *rootModule) CancelLoading() {
@@ -164,6 +180,10 @@ func (rm *rootModule) CancelLoading() {
 		rm.cancelLoading()
 	}
 	rm.setLoadingState(false)
+}
+
+func (rm *rootModule) LoadingDone() <-chan struct{} {
+	return rm.loadingDone
 }
 
 func (rm *rootModule) load(ctx context.Context) error {
@@ -325,7 +345,7 @@ func (rm *rootModule) UpdateModuleManifest(lockFile File) error {
 
 	mm, err := ParseModuleManifestFromFile(lockFile.Path())
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to update module manifest: %w", err)
 	}
 
 	rm.moduleManifest = mm
@@ -374,6 +394,8 @@ func (rm *rootModule) setSchemaLoaded(isLoaded bool) {
 }
 
 func (rm *rootModule) ReferencesModulePath(path string) bool {
+	rm.moduleMu.Lock()
+	defer rm.moduleMu.Unlock()
 	if rm.moduleManifest == nil {
 		return false
 	}
@@ -448,9 +470,7 @@ func (rm *rootModule) UpdateSchemaCache(ctx context.Context, lockFile File) erro
 	err := rm.schemaStorage.ObtainSchemasForModule(ctx,
 		rm.tfExec, rootModuleDirFromFilePath(lockFile.Path()))
 	if err != nil {
-		// We fail silently here to still allow tracking the module
-		// The schema can be loaded later via watcher
-		rm.logger.Printf("failed to update plugin cache for %s: %s", rm.Path(), err.Error())
+		return fmt.Errorf("failed to update plugin cache: %w", err)
 	}
 
 	return nil
